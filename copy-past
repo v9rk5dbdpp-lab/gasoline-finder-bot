@@ -121,18 +121,18 @@ async def process_region(message: Message, state: FSMContext):
     
     await state.update_data(region=region)
     await state.set_state(AddReportStates.entering_price)
-    await message.answer("Цена (если известна):")
+    await message.answer("Цена (если известна, можно пропустить командой /skip):")
 
 
 @router.message(StateFilter(AddReportStates.entering_price))
 async def process_price(message: Message, state: FSMContext):
     price = message.text.strip()
-    if price.lower() in ["не знаю", "нет"]:
+    if price.lower() in ["не знаю", "нет", "пропустить", "skip"]:
         price = None
     
     await state.update_data(price=price)
     await state.set_state(AddReportStates.entering_characteristics)
-    await message.answer("Характеристики (можно пропустить):")
+    await message.answer("Характеристики (если есть, можно пропустить командой /skip):")
 
 
 @router.message(StateFilter(AddReportStates.entering_characteristics))
@@ -140,7 +140,17 @@ async def process_characteristics(message: Message, state: FSMContext):
     characteristics = message.text.strip() if message.text else None
     await state.update_data(characteristics=characteristics)
     await state.set_state(AddReportStates.entering_details)
-    await message.answer("Дополнительная информация (можно пропустить):")
+    await message.answer("Дополнительная информация (можно пропустить командой /skip):")
+
+
+@router.message(Command("skip"), StateFilter(AddReportStates.entering_characteristics))
+async def skip_characteristics(message: Message, state: FSMContext):
+    await state.update_data(characteristics=None)
+    await state.set_state(AddReportStates.entering_details)
+    await message.answer(
+        "Характеристики пропущены.\n\n"
+        "Дополнительная информация (можно пропустить командой /skip):"
+    )
 
 
 @router.message(StateFilter(AddReportStates.entering_details))
@@ -148,7 +158,17 @@ async def process_details(message: Message, state: FSMContext):
     details = message.text.strip() if message.text else None
     await state.update_data(details=details)
     await state.set_state(AddReportStates.waiting_photo)
-    await message.answer("Отправь фото (или напиши /skip):")
+    await message.answer("Отправь фото подтверждения (или напиши /skip):")
+
+
+@router.message(Command("skip"), StateFilter(AddReportStates.entering_details))
+async def skip_details(message: Message, state: FSMContext):
+    await state.update_data(details=None)
+    await state.set_state(AddReportStates.waiting_photo)
+    await message.answer(
+        "Дополнительная информация пропущена.\n\n"
+        "Отправь фото подтверждения (или напиши /skip):"
+    )
 
 
 @router.message(Command("skip"), StateFilter(AddReportStates.waiting_photo))
@@ -202,7 +222,6 @@ async def confirm_add(callback: CallbackQuery, state: FSMContext):
             photo_file_id=data.get("photo_file_id")
         )
         
-        # Начисляем бонус
         contribution = await add_user_report_contribution(
             callback.from_user.id, 
             callback.from_user.username
