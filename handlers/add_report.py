@@ -1,0 +1,249 @@
+from aiogram import Router, F
+from aiogram.types import Message, CallbackQuery
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.filters import StateFilter, Command
+from keyboards import (
+    category_keyboard, fuel_type_keyboard, confirm_keyboard, 
+    main_menu_keyboard, location_request_keyboard
+)
+from database import add_report, get_user_last_report, add_user_report_contribution
+from config import CHANNEL_ID, PREMIUM_DAYS_REWARD
+from utils import is_suspicious_report
+import logging
+
+router = Router()
+logger = logging.getLogger(__name__)
+
+
+class AddReportStates(StatesGroup):
+    choosing_category = State()
+    entering_item = State()
+    entering_location = State()
+    entering_region = State()
+    entering_price = State()
+    entering_characteristics = State()
+    entering_details = State()
+    waiting_photo = State()
+    confirming = State()
+
+
+@router.message(F.text == "⛽ Добавить отчёт о товаре")
+async def start_add_report(message: Message, state: FSMContext):
+    await state.set_state(AddReportStates.choosing_category)
+    await message.answer("Выбери категорию товара:", reply_markup=category_keyboard())
+
+
+@router.callback_query(F.data.startswith("cat_"), StateFilter(AddReportStates.choosing_category))
+async def process_category(callback: CallbackQuery, state: FSMContext):
+    category_map = {
+        "cat_fuel": ("fuel", "Топливо / Бензин"),
+        "cat_groceries": ("groceries", "Продукты питания"),
+        "cat_medicine": ("medicine", "Медикаменты"),
+        "cat_other": ("other", "Другое")
+    }
+    
+    cat_key = callback.data
+    category, cat_name = category_map.get(cat_key, ("other", "Другое"))
+    
+    await state.update_data(category=category, category_name=cat_name)
+    await state.set_state(AddReportStates.entering_item)
+    
+    if category == "fuel":
+        await callback.message.edit_text(
+            "Отлично! Теперь выбери тип топлива:",
+            reply_markup=fuel_type_keyboard()
+        )
+    elif category == "other":
+        await callback.message.edit_text("🛠️ Категория «Другое» пока в разработке.")
+        await state.clear()
+    else:
+        await callback.message.edit_text(
+            f"Категория: <b>{cat_name}</b>\n\nНапиши название товара:"
+        )
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith("fuel_"), StateFilter(AddReportStates.entering_item))
+async def process_fuel_type(callback: CallbackQuery, state: FSMContext):
+    fuel_map = {
+        "fuel_ai92": "АИ-92",
+        "fuel_ai95": "АИ-95",
+        "fuel_ai98": "АИ-98",
+        "fuel_dt": "ДТ (Дизель)",
+    }
+    
+    if callback.data == "fuel_custom":
+        await callback.message.edit_text("Напиши точное название топлива:")
+        await state.set_state(AddReportStates.entering_item)
+    else:
+        item_name = fuel_map.get(callback.data, "Бензин")
+        await state.update_data(item_name=item_name)
+        await state.set_state(AddReportStates.entering_location)
+        await callback.message.edit_text(
+            f"Тип топлива: <b>{item_name}</b>\n\nУкажи место (название АЗС + адрес):"
+        )
+    await callback.answer()
+
+
+@router.message(StateFilter(AddReportStates.entering_item))
+async def process_item_name(message: Message, state: FSMContext):
+    item_name = message.text.strip()
+    if len(item_name) < 2:
+        await message.answer("Название слишком короткое.")
+        return
+    
+    await state.update_data(item_name=item_name)
+    await state.set_state(AddReportStates.entering_location)
+    await message.answer("Укажи место нахождения (адрес или отправь геолокацию):")
+
+
+@router.message(StateFilter(AddReportStates.entering_location))
+async def process_location(message: Message, state: FSMContext):
+    if message.location:
+        lat = message.location.latitude
+        lon = message.location.longitude
+        await state.update_data(latitude=lat, longitude=lon)
+        location_text = f"Геолокация ({lat:.5f}, {lon:.5f})"
+    else:
+        location_text = message.text.strip() if message.text else "Не указано"
+    
+    await state.update_data(location=location_text)
+    await state.set_state(AddReportStates.entering_region)
+    await message.answer("Укажи регион (город/область):")
+
+
+@router.message(StateFilter(AddReportStates.entering_region))
+async def process_region(message: Message, state: FSMContext):
+    region = message.text.strip()
+    if region.lower() in ["пропустить", "skip"]:
+        region = None
+    
+    await state.update_data(region=region)
+    await state.set_state(AddReportStates.entering_price)
+    await message.answer("Цена (если известна, можно пропустить командой /skip):")
+
+
+@router.message(StateFilter(AddReportStates.entering_price))
+async def process_price(message: Message, state: FSMContext):
+    price = message.text.strip()
+    if price.lower() in ["не знаю", "нет", "пропустить", "skip"]:
+        price = None
+    
+    await state.update_data(price=price)
+    await state.set_state(AddReportStates.entering_characteristics)
+    await message.answer("Характеристики (если есть, можно пропустить командой /skip):")
+
+
+@router.message(StateFilter(AddReportStates.entering_characteristics))
+async def process_characteristics(message: Message, state: FSMContext):
+    characteristics = message.text.strip() if message.text else None
+    await state.update_data(characteristics=characteristics)
+    await state.set_state(AddReportStates.entering_details)
+    await message.answer("Дополнительная информация (можно пропустить командой /skip):")
+
+
+@router.message(Command("skip"), StateFilter(AddReportStates.entering_characteristics))
+async def skip_characteristics(message: Message, state: FSMContext):
+    await state.update_data(characteristics=None)
+    await state.set_state(AddReportStates.entering_details)
+    await message.answer(
+        "Характеристики пропущены.\n\n"
+        "Дополнительная информация (можно пропустить командой /skip):"
+    )
+
+
+@router.message(StateFilter(AddReportStates.entering_details))
+async def process_details(message: Message, state: FSMContext):
+    details = message.text.strip() if message.text else None
+    await state.update_data(details=details)
+    await state.set_state(AddReportStates.waiting_photo)
+    await message.answer("Отправь фото подтверждения (или напиши /skip):")
+
+
+@router.message(Command("skip"), StateFilter(AddReportStates.entering_details))
+async def skip_details(message: Message, state: FSMContext):
+    await state.update_data(details=None)
+    await state.set_state(AddReportStates.waiting_photo)
+    await message.answer(
+        "Дополнительная информация пропущена.\n\n"
+        "Отправь фото подтверждения (или напиши /skip):"
+    )
+
+
+@router.message(Command("skip"), StateFilter(AddReportStates.waiting_photo))
+@router.message(F.photo, StateFilter(AddReportStates.waiting_photo))
+async def process_photo(message: Message, state: FSMContext):
+    if message.photo:
+        photo_file_id = message.photo[-1].file_id
+        await state.update_data(photo_file_id=photo_file_id)
+    else:
+        await state.update_data(photo_file_id=None)
+    
+    await show_confirmation(message, state)
+
+
+async def show_confirmation(message: Message, state: FSMContext):
+    data = await state.get_data()
+    
+    text = (
+        "📋 <b>Проверь данные:</b>\n\n"
+        f"📦 {data.get('item_name')}\n"
+        f"📍 {data.get('location')}\n"
+    )
+    if data.get('price'):
+        text += f"💰 {data.get('price')}\n"
+    if data.get('characteristics'):
+        text += f"🔧 {data.get('characteristics')}\n"
+    
+    text += "\nВсё верно?"
+    
+    await state.set_state(AddReportStates.confirming)
+    await message.answer(text, parse_mode="HTML", reply_markup=confirm_keyboard())
+
+
+@router.callback_query(F.data == "confirm_add", StateFilter(AddReportStates.confirming))
+async def confirm_add(callback: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    
+    try:
+        report_id = await add_report(
+            user_id=callback.from_user.id,
+            username=callback.from_user.username,
+            item_name=data.get("item_name"),
+            category=data.get("category"),
+            location=data.get("location"),
+            region=data.get("region"),
+            price=data.get("price"),
+            characteristics=data.get("characteristics"),
+            details=data.get("details"),
+            latitude=data.get("latitude"),
+            longitude=data.get("longitude"),
+            photo_file_id=data.get("photo_file_id")
+        )
+        
+        contribution = await add_user_report_contribution(
+            callback.from_user.id, 
+            callback.from_user.username
+        )
+        
+        success_text = f"✅ Отчёт #{report_id} добавлен!"
+        
+        if contribution.get("premium_granted"):
+            success_text += f"\n🎁 Получен/продлён Premium на {PREMIUM_DAYS_REWARD} дней!"
+        
+        await callback.message.edit_text(success_text)
+        await state.clear()
+        
+    except Exception as e:
+        logger.error(f"Ошибка: {e}")
+        await callback.message.edit_text("Ошибка при сохранении.")
+        await state.clear()
+    
+    await callback.answer()
+
+
+@router.callback_query(F.data == "cancel_add", StateFilter(AddReportStates.confirming))
+async def cancel_add(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await callback.message.edit_text("Добавление отменено.")
